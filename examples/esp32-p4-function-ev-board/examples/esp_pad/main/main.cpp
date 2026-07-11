@@ -90,6 +90,10 @@ extern "C" void app_main(void)
     assert(calculator != nullptr && "Failed to create calculator");
     assert((phone->installApp(calculator) >= 0) && "Failed to begin calculator");
 
+    ServerMonitor *server_monitor = new ServerMonitor();
+    assert(server_monitor != nullptr && "Failed to create server_monitor");
+    assert((phone->installApp(server_monitor) >= 0) && "Failed to begin server_monitor");
+
     MusicPlayer *music_player = new MusicPlayer();
     assert(music_player != nullptr && "Failed to create music_player");
     assert((phone->installApp(music_player) >= 0) && "Failed to begin music_player");
@@ -114,4 +118,11 @@ extern "C" void app_main(void)
 #endif
 
     esp_lv_adapter_unlock();
+
+    /* Defer WiFi auto-connect so phone UI finishes initializing first */
+    xTaskCreate([](void *) {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        AppSettings::wifiAutoInit();
+        vTaskDelete(NULL);
+    }, "wifi_auto", 4096, NULL, 5, NULL);
 }

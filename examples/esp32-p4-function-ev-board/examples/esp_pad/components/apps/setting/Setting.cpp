@@ -53,6 +53,8 @@
 #define NVS_KEY_BLE_ENABLE              "ble_en"
 #define NVS_KEY_AUDIO_VOLUME            "volume"
 #define NVS_KEY_DISPLAY_BRIGHTNESS      "brightness"
+#define NVS_KEY_WIFI_SSID               "wifi_ssid"
+#define NVS_KEY_WIFI_PASSWORD           "wifi_pwd"
 
 #define UI_MAIN_ITEM_LEFT_OFFSET        (20)
 #define UI_WIFI_LIST_UP_OFFSET          (20)
@@ -78,6 +80,29 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static char st_wifi_ssid[32];
 static char st_wifi_password[64];
+
+/* NVS helpers: persist WiFi credentials so they survive reboot */
+static void save_wifi_creds(const char *ssid, const char *password)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_STORAGE_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, NVS_KEY_WIFI_SSID, ssid);
+    nvs_set_str(h, NVS_KEY_WIFI_PASSWORD, password);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "WiFi credentials saved to NVS");
+}
+
+static bool load_wifi_creds(char *ssid, size_t ssid_n, char *password, size_t pwd_n)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_STORAGE_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    bool ok = (nvs_get_str(h, NVS_KEY_WIFI_SSID, ssid, &ssid_n) == ESP_OK &&
+               nvs_get_str(h, NVS_KEY_WIFI_PASSWORD, password, &pwd_n) == ESP_OK);
+    nvs_close(h);
+    if (ok) ESP_LOGI(TAG, "Loaded saved WiFi SSID: %s", ssid);
+    return ok;
+}
 
 static uint8_t base_mac_addr[6] = {0};
 static char mac_str[18] = {0};
@@ -472,8 +497,51 @@ void AppSettings::updateUiByNvsParam(void)
     lv_slider_set_value(ui_SliderPanelScreenSettingVolumeSwitch, _nvs_param_map[NVS_KEY_AUDIO_VOLUME], LV_ANIM_OFF);
 }
 
+void AppSettings::wifiAutoInit(void)
+{
+    /* Called once at boot from a deferred task.
+       Only creates the event group and pre-loads saved credentials.
+       The actual WiFi HW init is done by initWifi() when the Settings app runs. */
+    s_wifi_event_group = xEventGroupCreate();
+    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_SCANING);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_UI_INIT_DONE);
+
+    char saved_ssid[32] = {0}, saved_pwd[64] = {0};
+    if (!load_wifi_creds(saved_ssid, sizeof(saved_ssid), saved_pwd, sizeof(saved_pwd))) {
+        ESP_LOGI(TAG, "No saved WiFi credentials, skipping auto-connect");
+        return;
+    }
+    memcpy(st_wifi_ssid, saved_ssid, sizeof(st_wifi_ssid));
+    memcpy(st_wifi_password, saved_pwd, sizeof(st_wifi_password));
+    ESP_LOGI(TAG, "Pre-loaded saved WiFi credentials for SSID: %s", saved_ssid);
+
+    /* Trigger connect – initWifi() may have already started Wi-Fi by now,
+       making these calls safe; if not yet started, they will work when it does. */
+    wifi_config_t wifi_config = { 0 };
+    memcpy(wifi_config.sta.ssid, saved_ssid, sizeof(wifi_config.sta.ssid));
+    memcpy(wifi_config.sta.password, saved_pwd, sizeof(wifi_config.sta.password));
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_connect();
+    ESP_LOGI(TAG, "Auto-connecting to saved SSID: %s", saved_ssid);
+}
+
 esp_err_t AppSettings::initWifi()
 {
+    /* If wifiAutoInit() already ran the HW init, just register the
+       Settings-specific event handler (with valid 'this' for UI events). */
+    if (s_wifi_event_group && (xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_INIT_DONE)) {
+        esp_event_handler_instance_t inst;
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &wifiEventHandler,
+                                                            this,
+                                                            &inst));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
+        return ESP_OK;
+    }
+
     s_wifi_event_group = xEventGroupCreate();
     xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
     xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
@@ -757,6 +825,9 @@ void AppSettings::wifiConnectTask(void *arg)
     if (bits & WIFI_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "Connected successfully");
 
+        /* Persist credentials so auto-reconnect works after reboot */
+        save_wifi_creds(st_wifi_ssid, st_wifi_password);
+
         if (!app->_is_ui_del) {
             esp_lv_adapter_lock(-1);
             app->processWifiConnect(WIFI_CONNECT_SUCCESS);
@@ -813,12 +884,14 @@ void AppSettings::wifiEventHandler(void* arg, esp_event_base_t event_base, int32
         ESP_LOGI(TAG, "connected to ap SSID:%s, password:%s.", st_wifi_ssid, st_wifi_password);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
-        ESP_LOGI(TAG, "disconnected from ap SSID:%s, password:%s.", st_wifi_ssid, st_wifi_password);
-        memset(st_wifi_ssid, 0, sizeof(st_wifi_ssid));
+        ESP_LOGI(TAG, "disconnected from ap, trying to reconnect...");
+        /* Don't clear st_wifi_ssid – we need it for implicit reconnect.
+           If saved credentials exist in NVS, auto-reconnect. */
+        esp_wifi_connect();
 
         // app->back();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
-        if(lv_obj_has_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN) &&
+        if (app && lv_obj_has_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN) &&
            xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
             if (!app->_is_ui_del) {
                 esp_lv_adapter_lock(-1);

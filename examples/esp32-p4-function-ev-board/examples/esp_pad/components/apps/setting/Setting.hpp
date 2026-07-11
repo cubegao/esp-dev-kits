@@ -26,6 +26,9 @@ public:
     bool pause(void) override;
     bool resume(void) override;
 
+    /* Boot-time WiFi auto-connect using saved credentials (call from app_main) */
+    static void wifiAutoInit(void);
+
 private:
     typedef enum {
         UI_MAIN_SETTING_INDEX = 0,
