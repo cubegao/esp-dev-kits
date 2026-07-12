@@ -5,6 +5,8 @@
  */
 
 #include <cmath>
+#include "esp_chip_info.h"
+#include "esp_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -383,6 +385,76 @@ void AppSettings::extraUiInit(void)
     char char_ui_version[20];
     snprintf(char_ui_version, sizeof(char_ui_version), "v%d.%d.%d", ESP_BROOKESIA_CONF_VER_MAJOR, ESP_BROOKESIA_CONF_VER_MINOR, ESP_BROOKESIA_CONF_VER_PATCH);
     lv_label_set_text(ui_LabelPanelPanelScreenSettingAbout6, char_ui_version);
+
+    /* ==== Hardware Info (About page) ==== */
+    // Collect device info in PSRAM
+    char *dev_cpu   = (char *)heap_caps_malloc(64, MALLOC_CAP_SPIRAM);
+    char *dev_flash = (char *)heap_caps_malloc(32, MALLOC_CAP_SPIRAM);
+    char *dev_psram = (char *)heap_caps_malloc(32, MALLOC_CAP_SPIRAM);
+    char *dev_mac   = (char *)heap_caps_malloc(32, MALLOC_CAP_SPIRAM);
+    char *dev_idf   = (char *)heap_caps_malloc(32, MALLOC_CAP_SPIRAM);
+    char *dev_lcd   = (char *)heap_caps_malloc(32, MALLOC_CAP_SPIRAM);
+    if (!dev_cpu || !dev_flash || !dev_psram || !dev_mac || !dev_idf || !dev_lcd) {
+        ESP_LOGE(TAG, "PSRAM alloc failed for device info");
+    } else {
+        esp_chip_info_t chip;
+        esp_chip_info(&chip);
+        snprintf(dev_cpu, 64, "ESP32-P4  %d cores  rev %d",
+                 chip.cores, chip.revision);
+
+        uint32_t flash_sz;
+        if (esp_flash_get_size(NULL, &flash_sz) == ESP_OK) {
+            snprintf(dev_flash, 32, "%u MB", flash_sz / (1024 * 1024));
+        } else {
+            snprintf(dev_flash, 32, "unknown");
+        }
+
+        size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        snprintf(dev_psram, 32, "%u MB", (uint32_t)(psram_total / (1024 * 1024)));
+
+        snprintf(dev_mac, 32, "%02X-%02X-%02X-%02X-%02X-%02X",
+                 base_mac_addr[0], base_mac_addr[1], base_mac_addr[2],
+                 base_mac_addr[3], base_mac_addr[4], base_mac_addr[5]);
+
+        snprintf(dev_idf, 32, "ESP-IDF %s", IDF_VER);
+
+        snprintf(dev_lcd, 32, "MIPI-DSI %dx%d", BSP_LCD_H_RES, BSP_LCD_V_RES);
+
+        // Add rows to the About panel (enable scrolling)
+        lv_obj_add_flag(ui_PanelScreenSettingAbout, LV_OBJ_FLAG_SCROLLABLE);
+
+        auto addRow = [&](const char *name, const char *val) {
+            lv_obj_t *row = lv_obj_create(ui_PanelScreenSettingAbout);
+            lv_obj_set_width(row, lv_pct(96));
+            lv_obj_set_height(row, 56);
+            lv_obj_set_style_border_color(row, lv_color_hex(0xF6F6F6), 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_COVER, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *lb_name = lv_label_create(row);
+            lv_label_set_text(lb_name, name);
+            lv_obj_set_style_text_font(lb_name, &lv_font_montserrat_22, 0);
+            lv_obj_align(lb_name, LV_ALIGN_LEFT_MID, 20, 0);
+
+            lv_obj_t *lb_val = lv_label_create(row);
+            lv_label_set_text(lb_val, val);
+            lv_obj_set_style_text_font(lb_val, &lv_font_montserrat_22, 0);
+            lv_obj_align(lb_val, LV_ALIGN_RIGHT_MID, -20, 0);
+        };
+
+        addRow("CPU", dev_cpu);
+        addRow("Flash", dev_flash);
+        addRow("PSRAM", dev_psram);
+        addRow("MAC", dev_mac);
+        addRow("LCD", dev_lcd);
+        addRow("IDF", dev_idf);
+    }
+    free(dev_cpu);
+    free(dev_flash);
+    free(dev_psram);
+    free(dev_mac);
+    free(dev_idf);
+    free(dev_lcd);
 }
 
 void AppSettings::processWifiConnect(WifiConnectState_t state)
@@ -714,8 +786,9 @@ void AppSettings::euiRefresTask(void *arg)
             app_sntp_init();
 
             esp_lv_adapter_lock(-1);
+            /* Show at least "weak" when connected (signal strength unknown at boot) */
             if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_NONE) {
-                app->status_bar->setWifiIconState(0);
+                app->status_bar->setWifiIconState(1);
             } else if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_WEAK) {
                 app->status_bar->setWifiIconState(1);
             } else if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_MODERATE) {
